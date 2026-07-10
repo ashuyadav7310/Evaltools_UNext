@@ -1,0 +1,178 @@
+name: Deploy Evaltools
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: evaltools-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_ROLE_ARN: arn:aws:iam::585768185822:role/EvaltoolsUNextGitHubActionsDeployRole
+  ASG_NAME: comcoach-20260624112658-asg
+  ALB_DNS: comcoach-alb-20260624112658-911110873.ap-south-1.elb.amazonaws.com
+  SSH_USER: ec2-user
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package repository
+        run: |
+          set -euo pipefail
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='*/node_modules' \
+            --exclude='*/.next' \
+            --exclude='*/venv' \
+            --exclude='*/.venv' \
+            --exclude='*/__pycache__' \
+            --exclude='*/uploads' \
+            --exclude='*/reports' \
+            --exclude='*.log' \
+            -czf "$RUNNER_TEMP/evaltools-release.tar.gz" \
+            ComCoachAI ConvAI EvalAI root-dist
+
+      - name: Deploy release
+        run: |
+          set -euo pipefail
+
+          mapfile -t INSTANCE_IDS < <(
+            aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$ASG_NAME" \
+              --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService' && HealthStatus=='Healthy'].InstanceId" \
+              --output text | tr '\t' '\n' | sed '/^$/d'
+          )
+
+          if [ "${#INSTANCE_IDS[@]}" -eq 0 ]; then
+            echo "No healthy instances found in ASG: $ASG_NAME"
+            exit 1
+          fi
+
+          ssh-keygen -t ed25519 -N "" -f "$RUNNER_TEMP/eic_key" -q
+
+          for INSTANCE_ID in "${INSTANCE_IDS[@]}"; do
+            read -r AZ PUBLIC_IP STATE < <(
+              aws ec2 describe-instances \
+                --instance-ids "$INSTANCE_ID" \
+                --query "Reservations[0].Instances[0].[Placement.AvailabilityZone,PublicIpAddress,State.Name]" \
+                --output text
+            )
+
+            if [ "$STATE" != "running" ] || [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
+              echo "Skipping $INSTANCE_ID: state=$STATE public_ip=$PUBLIC_IP"
+              continue
+            fi
+
+            echo "Deploying to $INSTANCE_ID at $PUBLIC_IP"
+
+            aws ec2-instance-connect send-ssh-public-key \
+              --instance-id "$INSTANCE_ID" \
+              --availability-zone "$AZ" \
+              --instance-os-user "$SSH_USER" \
+              --ssh-public-key "file://$RUNNER_TEMP/eic_key.pub"
+
+            scp \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -i "$RUNNER_TEMP/eic_key" \
+              "$RUNNER_TEMP/evaltools-release.tar.gz" \
+              "$SSH_USER@$PUBLIC_IP:/tmp/evaltools-release.tar.gz"
+
+            ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -i "$RUNNER_TEMP/eic_key" \
+              "$SSH_USER@$PUBLIC_IP" \
+              'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          sudo dnf install -y rsync python3.11 python3.11-pip nodejs npm tar gzip
+
+          sudo rm -rf /tmp/evaltools-release
+          sudo mkdir -p /tmp/evaltools-release
+          sudo tar -xzf /tmp/evaltools-release.tar.gz -C /tmp/evaltools-release
+
+          sudo mkdir -p \
+            /opt/comcoach/ComCoachAI \
+            /opt/evaltools/ConvAI \
+            /opt/evaltools/deploy-new/EvalAI \
+            /opt/evaltools/deploy-new/root-dist \
+            /var/www/evaltools
+
+          sudo rsync -a --delete \
+            --exclude='.env' --exclude='venv/' --exclude='.venv/' \
+            --exclude='node_modules/' --exclude='.next/' \
+            --exclude='uploads/' --exclude='reports/' \
+            /tmp/evaltools-release/ComCoachAI/ /opt/comcoach/ComCoachAI/
+
+          sudo rsync -a --delete \
+            --exclude='.env' --exclude='venv/' --exclude='.venv/' \
+            --exclude='__pycache__/' \
+            /tmp/evaltools-release/ConvAI/ /opt/evaltools/ConvAI/
+
+          sudo rsync -a --delete \
+            --exclude='.env' --exclude='venv/' --exclude='.venv/' \
+            --exclude='__pycache__/' \
+            /tmp/evaltools-release/EvalAI/ /opt/evaltools/deploy-new/EvalAI/
+
+          sudo rsync -a --delete \
+            /tmp/evaltools-release/root-dist/ /opt/evaltools/deploy-new/root-dist/
+
+          sudo rsync -a --delete \
+            /tmp/evaltools-release/root-dist/ /var/www/evaltools/
+
+          cd /opt/comcoach/ComCoachAI
+          sudo python3.11 -m venv venv
+          sudo venv/bin/pip install --upgrade pip
+          sudo venv/bin/pip install --no-cache-dir -r requirements.txt
+
+          cd /opt/comcoach/ComCoachAI/frontend-next
+          sudo npm ci
+          sudo npm run build
+
+          cd /opt/evaltools/ConvAI
+          sudo python3.11 -m venv venv
+          sudo venv/bin/pip install --upgrade pip
+          sudo venv/bin/pip install --no-cache-dir -r requirements.txt
+
+          sudo systemctl daemon-reload
+          sudo systemctl restart comcoach-backend comcoach-frontend convai-backend nginx
+
+          sleep 5
+          systemctl is-active nginx comcoach-backend comcoach-frontend convai-backend
+          curl -fsS http://127.0.0.1/health
+          curl -fsS http://127.0.0.1:8000/health
+          curl -fsS http://127.0.0.1:8003/api/health >/dev/null
+
+          sudo rm -rf /tmp/evaltools-release /tmp/evaltools-release.tar.gz
+          REMOTE
+          done
+
+      - name: Check public load balancer
+        run: |
+          set -euo pipefail
+          curl -fsS "http://$ALB_DNS/health"
+          curl -fsS -o /dev/null "http://$ALB_DNS/"
+          curl -fsS -o /dev/null "http://$ALB_DNS/comcoachai"
+          curl -fsS -o /dev/null "http://$ALB_DNS/convai/"
