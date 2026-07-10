@@ -72,6 +72,15 @@ export default function AdminPage() {
   });
 
   const overview = overviewQuery.data;
+  const submitAdminAccess = () => {
+    const trimmedToken = token.trim();
+
+    if (!trimmedToken) {
+      return;
+    }
+
+    setAuthorizedToken(trimmedToken);
+  };
 
   return (
     <AppShell>
@@ -94,6 +103,12 @@ export default function AdminPage() {
                   setToken(event.target.value);
                   if (authorizedToken) setAuthorizedToken("");
                 }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    submitAdminAccess();
+                  }
+                }}
                 placeholder="Admin Token"
                 className="pr-11"
               />
@@ -106,7 +121,7 @@ export default function AdminPage() {
                 {showToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
               </button>
             </div>
-            <Button onClick={() => setAuthorizedToken(token.trim())} disabled={!token.trim()}>
+            <Button onClick={submitAdminAccess} disabled={!token.trim()}>
               Enter Admin Center
             </Button>
           </CardContent>
