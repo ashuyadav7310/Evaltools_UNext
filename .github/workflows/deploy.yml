@@ -147,7 +147,9 @@ jobs:
               $1 == key {
                 value=$0
                 sub("^[^=]*=", "", value)
-                gsub(/^'\''|'\''$/, "", value)
+                gsub(/\r/, "", value)
+                sub(/^'\''/, "", value)
+                sub(/'\''$/, "", value)
                 print value
                 exit
               }
@@ -164,8 +166,7 @@ jobs:
             exit 1
           fi
 
-          if [ ! -f /opt/comcoach/ComCoachAI/.env ]; then
-            sudo tee /opt/comcoach/ComCoachAI/.env >/dev/null <<ENV
+          sudo tee /opt/comcoach/ComCoachAI/.env >/dev/null <<ENV
           APP_ENV=production
           DATABASE_URL=postgresql://comcoach:${DB_PASS}@${DB_HOST}:5432/comcoachai
           OPENAI_API_KEY=${OPENAI_API_KEY_VALUE}
@@ -183,16 +184,13 @@ jobs:
           COMCOACH_API_BASE_URL=/api/comcoachai
           API_BASE_URL=/api/comcoachai
           ENV
-          fi
 
-          if [ ! -f /opt/evaltools/ConvAI/.env ]; then
-            sudo tee /opt/evaltools/ConvAI/.env >/dev/null <<ENV
+          sudo tee /opt/evaltools/ConvAI/.env >/dev/null <<ENV
           DATABASE_URL=postgresql://comcoach:${DB_PASS}@${DB_HOST}:5432/convai
           OPENAI_API_KEY=${OPENAI_API_KEY_VALUE}
           TRAINER_API_KEY=admin123
           CORS_ALLOW_ORIGINS=*
           ENV
-          fi
 
           sudo tee /etc/systemd/system/comcoach-backend.service >/dev/null <<SERVICE
           [Unit]
@@ -351,7 +349,27 @@ jobs:
           sudo nginx -t
           sudo systemctl restart comcoach-backend comcoach-frontend convai-backend nginx
 
-          sleep 5
+          for attempt in $(seq 1 30); do
+            if systemctl is-active --quiet nginx \
+              && systemctl is-active --quiet comcoach-backend \
+              && systemctl is-active --quiet comcoach-frontend \
+              && systemctl is-active --quiet convai-backend \
+              && curl -fsS http://127.0.0.1/health >/dev/null \
+              && curl -fsS http://127.0.0.1:8000/health >/dev/null \
+              && curl -fsS http://127.0.0.1:8003/api/health >/dev/null; then
+              break
+            fi
+
+            if [ "$attempt" -eq 30 ]; then
+              systemctl --no-pager --full status nginx comcoach-backend comcoach-frontend convai-backend || true
+              journalctl -u comcoach-backend -n 80 --no-pager -o cat || true
+              journalctl -u convai-backend -n 80 --no-pager -o cat || true
+              exit 1
+            fi
+
+            sleep 5
+          done
+
           systemctl is-active nginx comcoach-backend comcoach-frontend convai-backend
           curl -fsS http://127.0.0.1/health
           curl -fsS http://127.0.0.1:8000/health
