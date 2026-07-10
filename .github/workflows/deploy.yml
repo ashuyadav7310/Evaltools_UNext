@@ -107,7 +107,7 @@ jobs:
               'bash -s' <<'REMOTE'
           set -euo pipefail
 
-          sudo dnf install -y rsync python3.11 python3.11-pip nodejs npm tar gzip
+          sudo dnf install -y rsync python3.11 python3.11-pip nodejs npm nginx tar gzip
 
           sudo rm -rf /tmp/evaltools-release
           sudo mkdir -p /tmp/evaltools-release
@@ -142,6 +142,196 @@ jobs:
           sudo rsync -a --delete \
             /tmp/evaltools-release/root-dist/ /var/www/evaltools/
 
+          read_user_data_var() {
+            sudo awk -F= -v key="$1" '
+              $1 == key {
+                value=$0
+                sub("^[^=]*=", "", value)
+                gsub(/^'\''|'\''$/, "", value)
+                print value
+                exit
+              }
+            ' /var/lib/cloud/instance/user-data.txt
+          }
+
+          REGION="$(read_user_data_var REGION)"
+          DB_PASS="$(read_user_data_var DB_PASS)"
+          DB_HOST="$(read_user_data_var DB_HOST)"
+          OPENAI_API_KEY_VALUE="$(read_user_data_var OPENAI_API_KEY_VALUE)"
+
+          if [ -z "$REGION" ] || [ -z "$DB_PASS" ] || [ -z "$DB_HOST" ] || [ -z "$OPENAI_API_KEY_VALUE" ]; then
+            echo "Required runtime values are missing from instance user-data."
+            exit 1
+          fi
+
+          if [ ! -f /opt/comcoach/ComCoachAI/.env ]; then
+            sudo tee /opt/comcoach/ComCoachAI/.env >/dev/null <<ENV
+          APP_ENV=production
+          DATABASE_URL=postgresql://comcoach:${DB_PASS}@${DB_HOST}:5432/comcoachai
+          OPENAI_API_KEY=${OPENAI_API_KEY_VALUE}
+          ADMIN_TOKEN=admin123
+          HOST=0.0.0.0
+          PORT=8000
+          BACKEND_BASE_URL=http://127.0.0.1:8000
+          FRONTEND_BASE_URL=http://127.0.0.1:3002/comcoachai
+          CORS_ORIGINS=*
+          AWS_REGION=${REGION}
+          S3_ENABLED=true
+          S3_BUCKET_NAME=comcoach-storage-585768185822-ap-south-1-20260624112658
+          S3_AUDIO_PREFIX=audio
+          S3_REPORT_PREFIX=reports
+          COMCOACH_API_BASE_URL=/api/comcoachai
+          API_BASE_URL=/api/comcoachai
+          ENV
+          fi
+
+          if [ ! -f /opt/evaltools/ConvAI/.env ]; then
+            sudo tee /opt/evaltools/ConvAI/.env >/dev/null <<ENV
+          DATABASE_URL=postgresql://comcoach:${DB_PASS}@${DB_HOST}:5432/convai
+          OPENAI_API_KEY=${OPENAI_API_KEY_VALUE}
+          TRAINER_API_KEY=admin123
+          CORS_ALLOW_ORIGINS=*
+          ENV
+          fi
+
+          sudo tee /etc/systemd/system/comcoach-backend.service >/dev/null <<SERVICE
+          [Unit]
+          Description=ComCoach FastAPI Backend
+          After=network.target
+
+          [Service]
+          User=root
+          WorkingDirectory=/opt/comcoach/ComCoachAI
+          EnvironmentFile=/opt/comcoach/ComCoachAI/.env
+          ExecStart=/opt/comcoach/ComCoachAI/venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8000
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          sudo tee /etc/systemd/system/comcoach-frontend.service >/dev/null <<SERVICE
+          [Unit]
+          Description=ComCoach Next.js Frontend
+          After=network.target
+
+          [Service]
+          User=root
+          WorkingDirectory=/opt/comcoach/ComCoachAI/frontend-next
+          EnvironmentFile=/opt/comcoach/ComCoachAI/.env
+          Environment=PORT=3002
+          Environment=HOSTNAME=127.0.0.1
+          ExecStart=/usr/bin/env PORT=3002 HOSTNAME=127.0.0.1 /usr/bin/npm start
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          sudo tee /etc/systemd/system/convai-backend.service >/dev/null <<SERVICE
+          [Unit]
+          Description=ConvAI FastAPI Backend
+          After=network.target
+
+          [Service]
+          User=root
+          WorkingDirectory=/opt/evaltools/ConvAI/backend
+          EnvironmentFile=/opt/evaltools/ConvAI/.env
+          ExecStart=/opt/evaltools/ConvAI/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8003
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          sudo tee /etc/nginx/conf.d/evaltools.conf >/dev/null <<'NGINX'
+          server {
+              listen 80 default_server;
+              server_name _;
+              client_max_body_size 100M;
+
+              root /var/www/evaltools;
+              index "Home page.html" index.html;
+
+              location = /health {
+                  add_header Content-Type text/plain;
+                  return 200 "ok\n";
+              }
+
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+
+              location = /evalai {
+                  add_header Content-Type text/plain;
+                  return 503 "EvalAI is temporarily disabled.\n";
+              }
+
+              location /evalai/ {
+                  add_header Content-Type text/plain;
+                  return 503 "EvalAI is temporarily disabled.\n";
+              }
+
+              location /comcoachai {
+                  proxy_pass http://127.0.0.1:3002;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Prefix /comcoachai;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+              }
+
+              location = /api/comcoachai/health {
+                  proxy_pass http://127.0.0.1:8000/health;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              }
+
+              location /api/comcoachai/ {
+                  proxy_pass http://127.0.0.1:8000/api/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              location /api/ {
+                  proxy_pass http://127.0.0.1:8000/api/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              location = /convai {
+                  return 308 /convai/;
+              }
+
+              location /convai/ {
+                  alias /opt/evaltools/ConvAI/artifacts/interview-app/dist/;
+                  try_files $uri $uri/ /convai/index.html;
+              }
+
+              location /api/convai/ {
+                  proxy_pass http://127.0.0.1:8003/api/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Prefix /convai;
+              }
+          }
+          NGINX
+
+          sudo rm -f /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/comcoach.conf
+
           cd /opt/comcoach/ComCoachAI
           sudo python3.11 -m venv venv
           sudo venv/bin/pip install --upgrade pip
@@ -157,6 +347,8 @@ jobs:
           sudo venv/bin/pip install --no-cache-dir -r requirements.txt
 
           sudo systemctl daemon-reload
+          sudo systemctl enable comcoach-backend comcoach-frontend convai-backend nginx
+          sudo nginx -t
           sudo systemctl restart comcoach-backend comcoach-frontend convai-backend nginx
 
           sleep 5
