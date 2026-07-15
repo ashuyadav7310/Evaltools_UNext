@@ -223,6 +223,27 @@ jobs:
           CORS_ALLOW_ORIGINS=*
           ENV
 
+          sudo tee /etc/systemd/system/evalai-streamlit.service >/dev/null <<SERVICE
+          [Unit]
+          Description=EvalAI Streamlit UI
+          After=network.target
+
+          [Service]
+          User=root
+          WorkingDirectory=/opt/evaltools/deploy-new/EvalAI
+          Environment=PYTHONPATH=/opt/evaltools/deploy-new/EvalAI
+          Environment=STREAMLIT_SERVER_PORT=3001
+          Environment=STREAMLIT_SERVER_ADDRESS=127.0.0.1
+          Environment=STREAMLIT_SERVER_BASE_URL_PATH=evalai
+          Environment=STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+          ExecStart=/opt/evaltools/deploy-new/EvalAI/venv/bin/streamlit run ui/app.py --server.address 127.0.0.1 --server.port 3001 --server.baseUrlPath evalai --server.headless true --browser.gatherUsageStats false
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
           sudo tee /etc/systemd/system/comcoach-backend.service >/dev/null <<SERVICE
           [Unit]
           Description=ComCoach FastAPI Backend
@@ -295,13 +316,32 @@ jobs:
               }
 
               location = /evalai {
-                  add_header Content-Type text/plain;
-                  return 503 "EvalAI is temporarily disabled.\n";
+                  return 308 /evalai/;
               }
 
               location /evalai/ {
-                  add_header Content-Type text/plain;
-                  return 503 "EvalAI is temporarily disabled.\n";
+                  proxy_pass http://127.0.0.1:3001/evalai/;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Prefix /evalai;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 86400;
+              }
+
+              location /_stcore/ {
+                  proxy_pass http://127.0.0.1:3001/evalai/_stcore/;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 86400;
               }
 
               location /comcoachai {
@@ -375,36 +415,46 @@ jobs:
           sudo venv/bin/pip install --upgrade pip
           sudo venv/bin/pip install --no-cache-dir -r requirements.txt
 
+          cd /opt/evaltools/deploy-new/EvalAI
+          sudo mkdir -p input_data/Assignments input_data/students output/reports output/logs config/rubrics
+          sudo python3.11 -m venv venv
+          sudo venv/bin/pip install --upgrade pip
+          sudo venv/bin/pip install --no-cache-dir -r requirements.txt
+
           sudo systemctl daemon-reload
-          sudo systemctl enable comcoach-backend comcoach-frontend convai-backend nginx
+          sudo systemctl enable comcoach-backend comcoach-frontend convai-backend evalai-streamlit nginx
           sudo nginx -t
-          sudo systemctl restart comcoach-backend comcoach-frontend convai-backend nginx
+          sudo systemctl restart comcoach-backend comcoach-frontend convai-backend evalai-streamlit nginx
 
           for attempt in $(seq 1 30); do
             if systemctl is-active --quiet nginx \
               && systemctl is-active --quiet comcoach-backend \
               && systemctl is-active --quiet comcoach-frontend \
               && systemctl is-active --quiet convai-backend \
+              && systemctl is-active --quiet evalai-streamlit \
               && curl -fsS http://127.0.0.1/health >/dev/null \
               && curl -fsS http://127.0.0.1:8000/health >/dev/null \
-              && curl -fsS http://127.0.0.1:8003/api/health >/dev/null; then
+              && curl -fsS http://127.0.0.1:8003/api/health >/dev/null \
+              && curl -fsS http://127.0.0.1/evalai/ >/dev/null; then
               break
             fi
 
             if [ "$attempt" -eq 30 ]; then
-              systemctl --no-pager --full status nginx comcoach-backend comcoach-frontend convai-backend || true
+              systemctl --no-pager --full status nginx comcoach-backend comcoach-frontend convai-backend evalai-streamlit || true
               journalctl -u comcoach-backend -n 80 --no-pager -o cat || true
               journalctl -u convai-backend -n 80 --no-pager -o cat || true
+              journalctl -u evalai-streamlit -n 80 --no-pager -o cat || true
               exit 1
             fi
 
             sleep 5
           done
 
-          systemctl is-active nginx comcoach-backend comcoach-frontend convai-backend
+          systemctl is-active nginx comcoach-backend comcoach-frontend convai-backend evalai-streamlit
           curl -fsS http://127.0.0.1/health
           curl -fsS http://127.0.0.1:8000/health
           curl -fsS http://127.0.0.1:8003/api/health >/dev/null
+          curl -fsS http://127.0.0.1/evalai/ >/dev/null
 
           sudo rm -rf /tmp/evaltools-release /tmp/evaltools-release.tar.gz
           REMOTE
