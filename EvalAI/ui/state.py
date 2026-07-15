@@ -3,6 +3,8 @@ import streamlit as st
 
 def init_state():
     defaults = {
+        "evalai_authenticated": False,
+        "evalai_user": None,
         "job_id": None,
         "inputs_ready": False,
         "evaluation_running": False,

@@ -231,6 +231,7 @@ jobs:
           [Service]
           User=root
           WorkingDirectory=/opt/evaltools/deploy-new/EvalAI
+          EnvironmentFile=-/opt/evaltools/deploy-new/EvalAI/.env
           Environment=PYTHONPATH=/opt/evaltools/deploy-new/EvalAI
           Environment=STREAMLIT_SERVER_PORT=3001
           Environment=STREAMLIT_SERVER_ADDRESS=127.0.0.1
@@ -317,6 +318,10 @@ jobs:
 
               location = /evalai {
                   return 308 /evalai/;
+              }
+
+              location = /evalai/login {
+                  return 308 /evalai/?view=login;
               }
 
               location /evalai/ {
@@ -435,7 +440,8 @@ jobs:
               && curl -fsS http://127.0.0.1/health >/dev/null \
               && curl -fsS http://127.0.0.1:8000/health >/dev/null \
               && curl -fsS http://127.0.0.1:8003/api/health >/dev/null \
-              && curl -fsS http://127.0.0.1/evalai/ >/dev/null; then
+              && curl -fsS http://127.0.0.1/evalai/ >/dev/null \
+              && curl -fsSL http://127.0.0.1/evalai/login >/dev/null; then
               break
             fi
 
@@ -455,6 +461,7 @@ jobs:
           curl -fsS http://127.0.0.1:8000/health
           curl -fsS http://127.0.0.1:8003/api/health >/dev/null
           curl -fsS http://127.0.0.1/evalai/ >/dev/null
+          curl -fsSL http://127.0.0.1/evalai/login >/dev/null
 
           sudo rm -rf /tmp/evaltools-release /tmp/evaltools-release.tar.gz
           REMOTE
@@ -466,4 +473,5 @@ jobs:
           curl -fsS "http://$ALB_DNS/health"
           curl -fsS -o /dev/null "http://$ALB_DNS/"
           curl -fsS -o /dev/null "http://$ALB_DNS/comcoachai"
+          curl -fsSL -o /dev/null "http://$ALB_DNS/evalai/login"
           curl -fsS -o /dev/null "http://$ALB_DNS/convai/"

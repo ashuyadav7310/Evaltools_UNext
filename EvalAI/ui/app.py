@@ -9,6 +9,7 @@ if PROJECT_ROOT not in sys.path:
 
 import streamlit as st
 
+from ui.auth import render_user_controls, require_login
 from ui.state import init_state
 from ui.sections.upload_inputs import upload_inputs_section
 from ui.sections.run_evaluation import run_evaluation_section
@@ -22,6 +23,11 @@ st.set_page_config(
 )
 
 init_state()
+
+if not require_login():
+    st.stop()
+
+render_user_controls()
 
 st.title("EvalAI Tool")
 
