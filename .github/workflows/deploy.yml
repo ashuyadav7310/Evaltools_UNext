@@ -19,6 +19,9 @@ env:
   AWS_ROLE_ARN: arn:aws:iam::585768185822:role/EvaltoolsUNextGitHubActionsDeployRole
   ASG_NAME: comcoach-20260624112658-asg
   ALB_DNS: comcoach-alb-20260624112658-911110873.ap-south-1.elb.amazonaws.com
+  ARTIFACT_BUCKET: comcoach-artifacts-585768185822-ap-south-1-20260624112658
+  COMCOACH_BUNDLE: comcoach-20260624112658.tar.gz
+  ALL_TOOLS_BUNDLE: evaltools-all-20260624.tar.gz
   SSH_USER: ec2-user
 
 jobs:
@@ -52,6 +55,34 @@ jobs:
             --exclude='*.log' \
             -czf "$RUNNER_TEMP/evaltools-release.tar.gz" \
             ComCoachAI ConvAI EvalAI root-dist
+
+          tar \
+            --exclude='*/venv' \
+            --exclude='*/.venv' \
+            --exclude='*/__pycache__' \
+            --exclude='*/uploads' \
+            --exclude='*/reports' \
+            --exclude='*.log' \
+            -czf "$RUNNER_TEMP/$ALL_TOOLS_BUNDLE" \
+            ConvAI EvalAI root-dist
+
+          tar \
+            --exclude='node_modules' \
+            --exclude='.next' \
+            --exclude='venv' \
+            --exclude='.venv' \
+            --exclude='__pycache__' \
+            --exclude='uploads' \
+            --exclude='reports' \
+            --exclude='*.log' \
+            -czf "$RUNNER_TEMP/$COMCOACH_BUNDLE" \
+            -C ComCoachAI .
+
+      - name: Update launch artifacts
+        run: |
+          set -euo pipefail
+          aws s3 cp "$RUNNER_TEMP/$ALL_TOOLS_BUNDLE" "s3://$ARTIFACT_BUCKET/$ALL_TOOLS_BUNDLE"
+          aws s3 cp "$RUNNER_TEMP/$COMCOACH_BUNDLE" "s3://$ARTIFACT_BUCKET/$COMCOACH_BUNDLE"
 
       - name: Deploy release
         run: |
