@@ -2,9 +2,13 @@ name: Deploy Evaltools
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      git_ref:
+        description: Git ref to deploy (branch, tag or SHA)
+        required: false
+        default: main
 
 permissions:
   contents: read
@@ -17,461 +21,98 @@ concurrency:
 env:
   AWS_REGION: ap-south-1
   AWS_ROLE_ARN: arn:aws:iam::585768185822:role/EvaltoolsUNextGitHubActionsDeployRole
-  ASG_NAME: comcoach-20260624112658-asg
-  ALB_DNS: comcoach-alb-20260624112658-911110873.ap-south-1.elb.amazonaws.com
-  ARTIFACT_BUCKET: comcoach-artifacts-585768185822-ap-south-1-20260624112658
-  COMCOACH_BUNDLE: comcoach-20260624112658.tar.gz
-  ALL_TOOLS_BUNDLE: evaltools-all-20260624.tar.gz
-  SSH_USER: ec2-user
+  INSTANCE_TAG_NAME: evaltools-allinone
+  PUBLIC_ENDPOINT: http://3.108.101.12
 
 jobs:
   deploy:
-    name: Deploy to EC2
+    name: Build and roll out on the EvalTools host
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Package repository
+      # Nothing is packaged or uploaded here: the host clones this repo itself.
+      # This job only tells it which ref to build, over SSM. No SSH, no keys.
+      - name: Resolve target instance
+        id: target
         run: |
           set -euo pipefail
-          tar \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='*/node_modules' \
-            --exclude='*/.next' \
-            --exclude='*/venv' \
-            --exclude='*/.venv' \
-            --exclude='*/__pycache__' \
-            --exclude='*/uploads' \
-            --exclude='*/reports' \
-            --exclude='*.log' \
-            -czf "$RUNNER_TEMP/evaltools-release.tar.gz" \
-            ComCoachAI ConvAI EvalAI root-dist
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$INSTANCE_TAG_NAME" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[0].InstanceId' --output text)
 
-          tar \
-            --exclude='*/venv' \
-            --exclude='*/.venv' \
-            --exclude='*/__pycache__' \
-            --exclude='*/uploads' \
-            --exclude='*/reports' \
-            --exclude='*.log' \
-            -czf "$RUNNER_TEMP/$ALL_TOOLS_BUNDLE" \
-            ConvAI EvalAI root-dist
-
-          tar \
-            --exclude='node_modules' \
-            --exclude='.next' \
-            --exclude='venv' \
-            --exclude='.venv' \
-            --exclude='__pycache__' \
-            --exclude='uploads' \
-            --exclude='reports' \
-            --exclude='*.log' \
-            -czf "$RUNNER_TEMP/$COMCOACH_BUNDLE" \
-            -C ComCoachAI .
-
-      - name: Update launch artifacts
-        run: |
-          set -euo pipefail
-          aws s3 cp "$RUNNER_TEMP/$ALL_TOOLS_BUNDLE" "s3://$ARTIFACT_BUCKET/$ALL_TOOLS_BUNDLE"
-          aws s3 cp "$RUNNER_TEMP/$COMCOACH_BUNDLE" "s3://$ARTIFACT_BUCKET/$COMCOACH_BUNDLE"
-
-      - name: Deploy release
-        run: |
-          set -euo pipefail
-
-          mapfile -t INSTANCE_IDS < <(
-            aws autoscaling describe-auto-scaling-groups \
-              --auto-scaling-group-names "$ASG_NAME" \
-              --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService' && HealthStatus=='Healthy'].InstanceId" \
-              --output text | tr '\t' '\n' | sed '/^$/d'
-          )
-
-          if [ "${#INSTANCE_IDS[@]}" -eq 0 ]; then
-            echo "No healthy instances found in ASG: $ASG_NAME"
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::No running instance tagged Name=$INSTANCE_TAG_NAME."
+            echo "::error::The host is probably stopped. Start it, then re-run this workflow:"
+            echo "::error::  aws ec2 start-instances --region $AWS_REGION --instance-ids <id>"
             exit 1
           fi
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "Target instance: $INSTANCE_ID"
 
-          ssh-keygen -t ed25519 -N "" -f "$RUNNER_TEMP/eic_key" -q
-
-          for INSTANCE_ID in "${INSTANCE_IDS[@]}"; do
-            read -r AZ PUBLIC_IP STATE < <(
-              aws ec2 describe-instances \
-                --instance-ids "$INSTANCE_ID" \
-                --query "Reservations[0].Instances[0].[Placement.AvailabilityZone,PublicIpAddress,State.Name]" \
-                --output text
-            )
-
-            if [ "$STATE" != "running" ] || [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
-              echo "Skipping $INSTANCE_ID: state=$STATE public_ip=$PUBLIC_IP"
-              continue
-            fi
-
-            echo "Deploying to $INSTANCE_ID at $PUBLIC_IP"
-
-            aws ec2-instance-connect send-ssh-public-key \
-              --instance-id "$INSTANCE_ID" \
-              --availability-zone "$AZ" \
-              --instance-os-user "$SSH_USER" \
-              --ssh-public-key "file://$RUNNER_TEMP/eic_key.pub"
-
-            scp \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              -i "$RUNNER_TEMP/eic_key" \
-              "$RUNNER_TEMP/evaltools-release.tar.gz" \
-              "$SSH_USER@$PUBLIC_IP:/tmp/evaltools-release.tar.gz"
-
-            ssh \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              -i "$RUNNER_TEMP/eic_key" \
-              "$SSH_USER@$PUBLIC_IP" \
-              'bash -s' <<'REMOTE'
-          set -euo pipefail
-
-          sudo dnf install -y rsync python3.11 python3.11-pip nodejs npm nginx tar gzip
-
-          sudo rm -rf /tmp/evaltools-release
-          sudo mkdir -p /tmp/evaltools-release
-          sudo tar -xzf /tmp/evaltools-release.tar.gz -C /tmp/evaltools-release
-
-          sudo mkdir -p \
-            /opt/comcoach/ComCoachAI \
-            /opt/evaltools/ConvAI \
-            /opt/evaltools/deploy-new/EvalAI \
-            /opt/evaltools/deploy-new/root-dist \
-            /var/www/evaltools
-
-          sudo rsync -a --delete \
-            --exclude='.env' --exclude='venv/' --exclude='.venv/' \
-            --exclude='node_modules/' --exclude='.next/' \
-            --exclude='uploads/' --exclude='reports/' \
-            /tmp/evaltools-release/ComCoachAI/ /opt/comcoach/ComCoachAI/
-
-          sudo rsync -a --delete \
-            --exclude='.env' --exclude='venv/' --exclude='.venv/' \
-            --exclude='__pycache__/' \
-            /tmp/evaltools-release/ConvAI/ /opt/evaltools/ConvAI/
-
-          sudo rsync -a --delete \
-            --exclude='.env' --exclude='venv/' --exclude='.venv/' \
-            --exclude='__pycache__/' \
-            /tmp/evaltools-release/EvalAI/ /opt/evaltools/deploy-new/EvalAI/
-
-          sudo rsync -a --delete \
-            /tmp/evaltools-release/root-dist/ /opt/evaltools/deploy-new/root-dist/
-
-          sudo rsync -a --delete \
-            /tmp/evaltools-release/root-dist/ /var/www/evaltools/
-
-          read_user_data_var() {
-            sudo awk -F= -v key="$1" '
-              $1 == key {
-                value=$0
-                sub("^[^=]*=", "", value)
-                gsub(/\r/, "", value)
-                sub(/^'\''/, "", value)
-                sub(/'\''$/, "", value)
-                print value
-                exit
-              }
-            ' /var/lib/cloud/instance/user-data.txt
-          }
-
-          REGION="$(read_user_data_var REGION)"
-          DB_PASS="$(read_user_data_var DB_PASS)"
-          DB_HOST="$(read_user_data_var DB_HOST)"
-          OPENAI_API_KEY_VALUE="$(read_user_data_var OPENAI_API_KEY_VALUE)"
-
-          if [ -z "$REGION" ] || [ -z "$DB_PASS" ] || [ -z "$DB_HOST" ] || [ -z "$OPENAI_API_KEY_VALUE" ]; then
-            echo "Required runtime values are missing from instance user-data."
-            exit 1
-          fi
-
-          sudo tee /opt/comcoach/ComCoachAI/.env >/dev/null <<ENV
-          APP_ENV=production
-          DATABASE_URL=postgresql://comcoach:${DB_PASS}@${DB_HOST}:5432/comcoachai
-          OPENAI_API_KEY=${OPENAI_API_KEY_VALUE}
-          ADMIN_TOKEN=admin123
-          HOST=0.0.0.0
-          PORT=8000
-          BACKEND_BASE_URL=http://127.0.0.1:8000
-          FRONTEND_BASE_URL=http://127.0.0.1:3002/comcoachai
-          CORS_ORIGINS=*
-          AWS_REGION=${REGION}
-          S3_ENABLED=true
-          S3_BUCKET_NAME=comcoach-storage-585768185822-ap-south-1-20260624112658
-          S3_AUDIO_PREFIX=audio
-          S3_REPORT_PREFIX=reports
-          COMCOACH_API_BASE_URL=/api/comcoachai
-          API_BASE_URL=/api/comcoachai
-          ENV
-
-          sudo tee /opt/evaltools/ConvAI/.env >/dev/null <<ENV
-          DATABASE_URL=postgresql://comcoach:${DB_PASS}@${DB_HOST}:5432/convai
-          OPENAI_API_KEY=${OPENAI_API_KEY_VALUE}
-          TRAINER_API_KEY=admin123
-          CORS_ALLOW_ORIGINS=*
-          ENV
-
-          sudo tee /etc/systemd/system/evalai-streamlit.service >/dev/null <<SERVICE
-          [Unit]
-          Description=EvalAI Streamlit UI
-          After=network.target
-
-          [Service]
-          User=root
-          WorkingDirectory=/opt/evaltools/deploy-new/EvalAI
-          EnvironmentFile=-/opt/evaltools/deploy-new/EvalAI/.env
-          Environment=PYTHONPATH=/opt/evaltools/deploy-new/EvalAI
-          Environment=STREAMLIT_SERVER_PORT=3001
-          Environment=STREAMLIT_SERVER_ADDRESS=127.0.0.1
-          Environment=STREAMLIT_SERVER_BASE_URL_PATH=evalai
-          Environment=STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
-          ExecStart=/opt/evaltools/deploy-new/EvalAI/venv/bin/streamlit run ui/app.py --server.address 127.0.0.1 --server.port 3001 --server.baseUrlPath evalai --server.headless true --browser.gatherUsageStats false
-          Restart=always
-          RestartSec=5
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
-
-          sudo tee /etc/systemd/system/comcoach-backend.service >/dev/null <<SERVICE
-          [Unit]
-          Description=ComCoach FastAPI Backend
-          After=network.target
-
-          [Service]
-          User=root
-          WorkingDirectory=/opt/comcoach/ComCoachAI
-          EnvironmentFile=/opt/comcoach/ComCoachAI/.env
-          ExecStart=/opt/comcoach/ComCoachAI/venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8000
-          Restart=always
-          RestartSec=5
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
-
-          sudo tee /etc/systemd/system/comcoach-frontend.service >/dev/null <<SERVICE
-          [Unit]
-          Description=ComCoach Next.js Frontend
-          After=network.target
-
-          [Service]
-          User=root
-          WorkingDirectory=/opt/comcoach/ComCoachAI/frontend-next
-          EnvironmentFile=/opt/comcoach/ComCoachAI/.env
-          Environment=PORT=3002
-          Environment=HOSTNAME=127.0.0.1
-          ExecStart=/usr/bin/env PORT=3002 HOSTNAME=127.0.0.1 /usr/bin/npm start
-          Restart=always
-          RestartSec=5
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
-
-          sudo tee /etc/systemd/system/convai-backend.service >/dev/null <<SERVICE
-          [Unit]
-          Description=ConvAI FastAPI Backend
-          After=network.target
-
-          [Service]
-          User=root
-          WorkingDirectory=/opt/evaltools/ConvAI/backend
-          EnvironmentFile=/opt/evaltools/ConvAI/.env
-          ExecStart=/opt/evaltools/ConvAI/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8003
-          Restart=always
-          RestartSec=5
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
-
-          sudo tee /etc/nginx/conf.d/evaltools.conf >/dev/null <<'NGINX'
-          server {
-              listen 80 default_server;
-              server_name _;
-              client_max_body_size 100M;
-
-              root /var/www/evaltools;
-              index "Home page.html" index.html;
-
-              location = /health {
-                  add_header Content-Type text/plain;
-                  return 200 "ok\n";
-              }
-
-              location / {
-                  try_files $uri $uri/ /index.html;
-              }
-
-              location = /evalai {
-                  return 308 /evalai/;
-              }
-
-              location = /evalai/login {
-                  return 308 /evalai/?view=login;
-              }
-
-              location /evalai/ {
-                  proxy_pass http://127.0.0.1:3001/evalai/;
-                  proxy_http_version 1.1;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-                  proxy_set_header X-Forwarded-Prefix /evalai;
-                  proxy_set_header Upgrade $http_upgrade;
-                  proxy_set_header Connection "upgrade";
-                  proxy_read_timeout 86400;
-              }
-
-              location /_stcore/ {
-                  proxy_pass http://127.0.0.1:3001/evalai/_stcore/;
-                  proxy_http_version 1.1;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-                  proxy_set_header Upgrade $http_upgrade;
-                  proxy_set_header Connection "upgrade";
-                  proxy_read_timeout 86400;
-              }
-
-              location /comcoachai {
-                  proxy_pass http://127.0.0.1:3002;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-                  proxy_set_header X-Forwarded-Prefix /comcoachai;
-                  proxy_http_version 1.1;
-                  proxy_set_header Upgrade $http_upgrade;
-                  proxy_set_header Connection "upgrade";
-              }
-
-              location = /api/comcoachai/health {
-                  proxy_pass http://127.0.0.1:8000/health;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-              }
-
-              location /api/comcoachai/ {
-                  proxy_pass http://127.0.0.1:8000/api/;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-              }
-
-              location /api/ {
-                  proxy_pass http://127.0.0.1:8000/api/;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-              }
-
-              location = /convai {
-                  return 308 /convai/;
-              }
-
-              location /convai/ {
-                  alias /opt/evaltools/ConvAI/artifacts/interview-app/dist/;
-                  try_files $uri $uri/ /convai/index.html;
-              }
-
-              location /api/convai/ {
-                  proxy_pass http://127.0.0.1:8003/api/;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-                  proxy_set_header X-Forwarded-Prefix /convai;
-              }
-          }
-          NGINX
-
-          sudo rm -f /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/comcoach.conf
-
-          cd /opt/comcoach/ComCoachAI
-          sudo python3.11 -m venv venv
-          sudo venv/bin/pip install --upgrade pip
-          sudo venv/bin/pip install --no-cache-dir -r requirements.txt
-
-          cd /opt/comcoach/ComCoachAI/frontend-next
-          sudo npm ci
-          sudo npm run build
-
-          cd /opt/evaltools/ConvAI
-          sudo python3.11 -m venv venv
-          sudo venv/bin/pip install --upgrade pip
-          sudo venv/bin/pip install --no-cache-dir -r requirements.txt
-
-          cd /opt/evaltools/deploy-new/EvalAI
-          sudo mkdir -p input_data/Assignments input_data/students output/reports output/logs config/rubrics
-          sudo python3.11 -m venv venv
-          sudo venv/bin/pip install --upgrade pip
-          sudo venv/bin/pip install --no-cache-dir -r requirements.txt
-
-          sudo systemctl daemon-reload
-          sudo systemctl enable comcoach-backend comcoach-frontend convai-backend evalai-streamlit nginx
-          sudo nginx -t
-          sudo systemctl restart comcoach-backend comcoach-frontend convai-backend evalai-streamlit nginx
-
-          for attempt in $(seq 1 30); do
-            if systemctl is-active --quiet nginx \
-              && systemctl is-active --quiet comcoach-backend \
-              && systemctl is-active --quiet comcoach-frontend \
-              && systemctl is-active --quiet convai-backend \
-              && systemctl is-active --quiet evalai-streamlit \
-              && curl -fsS http://127.0.0.1/health >/dev/null \
-              && curl -fsS http://127.0.0.1:8000/health >/dev/null \
-              && curl -fsS http://127.0.0.1:8003/api/health >/dev/null \
-              && curl -fsS http://127.0.0.1/evalai/ >/dev/null \
-              && curl -fsSL http://127.0.0.1/evalai/login >/dev/null; then
-              break
-            fi
-
-            if [ "$attempt" -eq 30 ]; then
-              systemctl --no-pager --full status nginx comcoach-backend comcoach-frontend convai-backend evalai-streamlit || true
-              journalctl -u comcoach-backend -n 80 --no-pager -o cat || true
-              journalctl -u convai-backend -n 80 --no-pager -o cat || true
-              journalctl -u evalai-streamlit -n 80 --no-pager -o cat || true
-              exit 1
-            fi
-
-            sleep 5
-          done
-
-          systemctl is-active nginx comcoach-backend comcoach-frontend convai-backend evalai-streamlit
-          curl -fsS http://127.0.0.1/health
-          curl -fsS http://127.0.0.1:8000/health
-          curl -fsS http://127.0.0.1:8003/api/health >/dev/null
-          curl -fsS http://127.0.0.1/evalai/ >/dev/null
-          curl -fsSL http://127.0.0.1/evalai/login >/dev/null
-
-          sudo rm -rf /tmp/evaltools-release /tmp/evaltools-release.tar.gz
-          REMOTE
-          done
-
-      - name: Check public load balancer
+      - name: Roll out
         run: |
           set -euo pipefail
-          curl -fsS "http://$ALB_DNS/health"
-          curl -fsS -o /dev/null "http://$ALB_DNS/"
-          curl -fsS -o /dev/null "http://$ALB_DNS/comcoachai"
-          curl -fsSL -o /dev/null "http://$ALB_DNS/evalai/login"
-          curl -fsS -o /dev/null "http://$ALB_DNS/convai/"
+          # Deploy the exact commit that triggered this run, so two quick pushes
+          # cannot race and land the wrong tree.
+          REF="${{ github.event.inputs.git_ref || github.sha }}"
+          INSTANCE_ID="${{ steps.target.outputs.instance_id }}"
+          echo "Deploying ref: $REF"
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "GHA deploy ${GITHUB_RUN_ID}" \
+            --timeout-seconds 900 \
+            --parameters "commands=['/opt/evaltools-stack/scripts/deploy.sh $REF'],executionTimeout=['3600']" \
+            --query 'Command.CommandId' --output text)
+          echo "SSM command id: $CMD_ID"
+
+          # Image builds can take a while (torch, spaCy, npm ci) on a cold cache.
+          STATUS=Pending
+          for _ in $(seq 1 240); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
+            sleep 15
+          done
+
+          echo "----- deploy output -----"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text || true
+          ERR=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query StandardErrorContent --output text || true)
+          if [ -n "$ERR" ] && [ "$ERR" != "None" ]; then
+            echo "----- stderr -----"; echo "$ERR"
+          fi
+
+          [ "$STATUS" = "Success" ] || { echo "::error::Deploy finished as $STATUS"; exit 1; }
+
+      - name: Verify public routes
+        run: |
+          set -uo pipefail
+          fail=0
+          check() {
+            code=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 30 "$PUBLIC_ENDPOINT$1" || echo 000)
+            if [ "$code" = "200" ]; then
+              printf '  ok    %-26s %s\n' "$1" "$code"
+            else
+              printf '  FAIL  %-26s %s\n' "$1" "$code"; fail=1
+            fi
+          }
+          check /health
+          check /
+          check /comcoachai
+          check /api/comcoachai/health
+          check /convai/
+          check /api/convai/healthz
+          check /evalai/
+          check /_stcore/health
+          exit $fail
