@@ -21,7 +21,11 @@ concurrency:
 env:
   AWS_REGION: ap-south-1
   AWS_ROLE_ARN: arn:aws:iam::585768185822:role/EvaltoolsUNextGitHubActionsDeployRole
-  INSTANCE_TAG_NAME: evaltools-allinone
+  # Selected by Project+Role rather than the Name tag: Name gets edited by
+  # humans, and Project=Evaltools is also what the deploy role's IAM condition
+  # keys on, so anything this resolves to is guaranteed to accept SendCommand.
+  INSTANCE_TAG_PROJECT: Evaltools
+  INSTANCE_TAG_ROLE: app
   PUBLIC_ENDPOINT: http://3.108.101.12
 
 jobs:
@@ -42,17 +46,25 @@ jobs:
         id: target
         run: |
           set -euo pipefail
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=$INSTANCE_TAG_NAME" \
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=$INSTANCE_TAG_PROJECT" \
+                      "Name=tag:Role,Values=$INSTANCE_TAG_ROLE" \
                       "Name=instance-state-name,Values=running" \
-            --query 'Reservations[].Instances[0].InstanceId' --output text)
+            --query 'Reservations[].Instances[].InstanceId' --output text)
 
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "::error::No running instance tagged Name=$INSTANCE_TAG_NAME."
+          COUNT=$(echo $INSTANCE_IDS | wc -w)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No running instance tagged Project=$INSTANCE_TAG_PROJECT, Role=$INSTANCE_TAG_ROLE."
             echo "::error::The host is probably stopped. Start it, then re-run this workflow:"
             echo "::error::  aws ec2 start-instances --region $AWS_REGION --instance-ids <id>"
             exit 1
           fi
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::error::Expected exactly one host, found $COUNT: $INSTANCE_IDS"
+            echo "::error::Refusing to guess which one to deploy to."
+            exit 1
+          fi
+          INSTANCE_ID=$INSTANCE_IDS
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
           echo "Target instance: $INSTANCE_ID"
 
